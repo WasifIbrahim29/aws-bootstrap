@@ -4,7 +4,8 @@ Parameters:
   EC2InstanceType:
     Type: String
   EC2AMI:
-    Type: String
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
   CodePipelineBucket:
     Type: String
     Description: 'The S3 bucket for CodePipeline artifacts.'
@@ -23,14 +24,43 @@ Parameters:
     NoEcho: true
     Description: 'A GitHub personal access token with "repo" and
 "admin:repo_hook" permissions.'
-  Domain:
-    Type: String
-  Certificate:
-    Type: String
-    Description: 'An existing ACM certificate ARN for your domain'
+
 
 Resources:
 
+  SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub 'Internal Security group for ${AWS::StackName}'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+  InstanceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - "ec2.amazonaws.com"
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchFullAccess
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforAWSCodeDeploy
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
   DeploymentRole:
     Type: AWS::IAM::Role
     Properties:
@@ -46,7 +76,6 @@ Resources:
           Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/PowerUserAccess
-
   BuildProject:
     Type: AWS::CodeBuild::Project
     Properties:
@@ -60,33 +89,23 @@ Resources:
         Image: aws/codebuild/standard:2.0
       Source:
         Type: CODEPIPELINE
-
   DeploymentApplication:
     Type: AWS::CodeDeploy::Application
     Properties:
       ApplicationName: !Ref AWS::StackName
       ComputePlatform: Server
-
   StagingDeploymentGroup:
     Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn: Instance
     Properties:
       DeploymentGroupName: staging
-      AutoScalingGroups:
-      - !GetAtt Staging.Outputs.ScalingGroup
-      ApplicationName: !Ref DeploymentApplication 
-      DeploymentConfigName: CodeDeployDefault.AllAtOnce 
+      ApplicationName: !Ref DeploymentApplication
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
       ServiceRoleArn: !GetAtt DeploymentRole.Arn
-
-  ProdDeploymentGroup:
-    Type: AWS::CodeDeploy::DeploymentGroup
-    Properties:
-      DeploymentGroupName: prod
-      AutoScalingGroups:
-        - !GetAtt Prod.Outputs.ScalingGroup 
-      ApplicationName: !Ref DeploymentApplication 
-      DeploymentConfigName: CodeDeployDefault.OneAtATime
-      ServiceRoleArn: !GetAtt DeploymentRole.Arn
-
+      Ec2TagFilters:
+        - Key: aws:cloudformation:stack-name
+          Type: KEY_AND_VALUE
+          Value: !Ref AWS::StackName
   Pipeline:
     Type: AWS::CodePipeline::Pipeline
     Properties:
@@ -142,21 +161,6 @@ Resources:
                 ApplicationName: !Ref DeploymentApplication
                 DeploymentGroupName: !Ref StagingDeploymentGroup
               RunOrder: 1
-        - Name: Prod 
-          Actions:
-            - Name: Prod 
-              InputArtifacts:
-                - Name: Build 
-              ActionTypeId:
-                Category: Deploy
-                Owner: AWS
-                Version: 1
-                Provider: CodeDeploy
-              Configuration:
-                ApplicationName: !Ref DeploymentApplication 
-                DeploymentGroupName: !Ref ProdDeploymentGroup
-              RunOrder: 1
-
   PipelineWebhook:
     Type: AWS::CodePipeline::Webhook
     Properties:
@@ -171,42 +175,96 @@ Resources:
       Name: !Sub 'webhook-${AWS::StackName}'
       TargetPipelineVersion: !GetAtt Pipeline.Version
       RegisterWithThirdParty: true
-
-  Staging:
-    Type: AWS::CloudFormation::Stack
+  InstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
     Properties:
-      TemplateURL: stage.yml
-      TimeoutInMinutes: 30 
-      Parameters:
-        EC2InstanceType: !Ref EC2InstanceType 
-        EC2AMI: !Ref EC2AMI
-        Domain: !Ref Domain
-        SubDomain: staging
-        Certificate: !Ref Certificate
-
-  Prod:
-    Type: AWS::CloudFormation::Stack 
-    DependsOn: Staging
+      Roles:
+        - Ref: InstanceRole
+  Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy: 
+      ResourceSignal:
+        Timeout: PT15M
+        Count: 1
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages: 
+            yum:
+             ruby: []
+              #wget: []
+              #unzip: []
+          files:
+            /home/ec2-user/install:
+              source: !Sub "https://aws-codedeploy-${AWS::Region}.s3.amazonaws.com/latest/install"
+              mode: "000755" # executable
+          commands:
+            00-install-cd-agent:
+              command: "./install auto"
+              cwd: "/home/ec2-user/"
     Properties:
-      TemplateURL: stage.yml 
-      TimeoutInMinutes: 30 
-      Parameters:
-        EC2InstanceType: !Ref EC2InstanceType 
-        EC2AMI: !Ref EC2AMI
-        Domain: !Ref Domain
-        SubDomain: prod
-        Certificate: !Ref Certificate
+      ImageId: !Ref EC2AMI
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      Monitoring: true
+      SecurityGroupIds:
+        - !GetAtt SecurityGroup.GroupId 
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+
+          # send script output to /tmp so we can debug boot failures
+          exec > /tmp/userdata.log 2>&1 
+
+          # Update all packages
+          yum -y update
+
+          # Get latest cfn scripts; https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/best-practices.html#cfninit
+          yum install -y aws-cfn-bootstrap
+
+          cat > /tmp/install_script.sh << EOF 
+            # START
+            echo "Setting up NodeJS Environment"
+            curl https://raw.githubusercontent.com/nvm-sh/nvm/v0.34.0/install.sh | bash
+
+            # Dot source the files to ensure that variables are available within the current shell
+            . /home/ec2-user/.nvm/nvm.sh
+            . /home/ec2-user/.bashrc
+
+            # Install NVM, NPM, Node.JS
+            nvm alias default v12.7.0
+            nvm install v12.7.0
+            nvm use v12.7.0
+
+            # Download latest code, unzip it into /home/ec2-user/app
+            #wget https://github.com/WasifIbrahim29/aws-bootstrap/archive/master.zip 
+            #unzip master.zip
+            #mv aws-bootstrap-master app
+
+            # Create log directory
+            mkdir -p /home/ec2-user/app/logs
+
+            # Run server
+            #cd app
+            #npm install
+            #npm start
+          EOF
+
+          chown ec2-user:ec2-user /tmp/install_script.sh && chmod a+x /tmp/install_script.sh
+          sleep 1; sudo su - ec2-user -c "/tmp/install_script.sh" 
+
+          # Have CloudFormation install any files and packages from the metadata
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} --resource Instance
+          # Signal to CloudFormation that the instance is ready
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --region ${AWS::Region} --resource Instance 
+          
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
 
 Outputs:
-
-  StagingHTTPSLBEndpoint:
-    Description: The DNS name for the staging HTTPS LB 
-    Value: !GetAtt Staging.Outputs.HTTPSEndpoint 
+  InstanceEndpoint:
+    Description: The DNS name for the created instance
+    Value: !Sub "http://${Instance.PublicDnsName}:8080" 
     Export:
-      Name: StagingHTTPSLBEndpoint
-
-  ProdHTTPSLBEndpoint:
-    Description: The DNS name for the prod HTTPS LB 
-    Value: !GetAtt Prod.Outputs.HTTPSEndpoint 
-    Export:
-      Name: ProdHTTPSLBEndpoint
+      Name: InstanceEndpoint
