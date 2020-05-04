@@ -1,10 +1,10 @@
-source aws.sh
+source aws_credentials.sh
 mkdir -p ~/.github
 echo "aws-bootstrap" > ~/.github/aws-bootstrap-repo
 echo "WasifIbrahim29" > ~/.github/aws-bootstrap-owner
-echo "68c54cd406a35f34ac1272f003189729b3c3f653" > ~/.github/aws-bootstrap-access-token
+echo "1314a335d5f3460a2ecc068fdd70423d4b7b1db1" > ~/.github/aws-bootstrap-access-token
 
-STACK_NAME=awsbootstrap111
+STACK_NAME=awsbootstrap
 REGION=us-east-1 
 CLI_PROFILE=awsbootstrap
 EC2_INSTANCE_TYPE=t2.micro 
